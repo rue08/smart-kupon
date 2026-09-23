@@ -1,6 +1,9 @@
 import uuid
+from datetime import timedelta
 
+from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 from accounts.models import User
 from sources.models import SourceMessage
@@ -56,7 +59,11 @@ class Coupon(models.Model):
     coupon_code = models.CharField(max_length=100)
     discount_value = models.CharField(max_length=100, blank=True)  # as extracted, e.g. "20%", "FLAT 50"
     expiry_date = models.DateField(null=True, blank=True)
-    status = models.CharField(max_length=20, choices=Status.choices, default=Status.ACTIVE)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.ACTIVE, db_index=True)
+    # Set by the extraction engine when a coupon code was found but merchant
+    # and/or expiry couldn't be resolved confidently (FR-3.4) — surfaced to
+    # the user to confirm or discard rather than silently trusted.
+    is_low_confidence = models.BooleanField(default=False)
 
     # normalize(merchant) + normalize(code); (user, dedup_key) enforces FR-4.2.
     dedup_key = models.CharField(max_length=255)
@@ -70,6 +77,25 @@ class Coupon(models.Model):
         indexes = [
             models.Index(fields=['user', 'dedup_key']),
         ]
+
+    def compute_status(self):
+        """The status this coupon should have right now, per FR-6.1.
+
+        `used` is a persisted manual fact and always wins. The other three
+        states are derived from expiry_date -- the single definition callers
+        (coupons.pipeline, coupons.views detail self-heal,
+        coupons.status_refresh's bulk job) all rely on to stay consistent.
+        """
+        if self.status == self.Status.USED:
+            return self.Status.USED
+        if self.expiry_date is None:
+            return self.Status.ACTIVE
+        today = timezone.localdate()
+        if self.expiry_date < today:
+            return self.Status.EXPIRED
+        if self.expiry_date <= today + timedelta(days=settings.COUPON_EXPIRING_SOON_DAYS):
+            return self.Status.EXPIRING_SOON
+        return self.Status.ACTIVE
 
     def __str__(self):
         return f'{self.coupon_code} ({self.merchant})'

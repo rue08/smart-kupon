@@ -7,6 +7,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.models import User
+from coupons.pipeline import process_message
 
 from . import crypto, gmail_oauth, gmail_sync
 from .models import GmailCredential, SourceMessage
@@ -126,7 +127,7 @@ class SMSSyncView(APIView):
             external_id = item['external_id'] or _sms_dedup_key(item['sender'], item['body'])
             raw_text = f"From: {item['sender']}\n{item['body']}" if item['sender'] else item['body']
 
-            _, was_created = SourceMessage.objects.get_or_create(
+            source_message, was_created = SourceMessage.objects.get_or_create(
                 user=request.user,
                 source_type=SourceMessage.SourceType.SMS,
                 external_id=external_id,
@@ -134,6 +135,7 @@ class SMSSyncView(APIView):
             )
             if was_created:
                 created += 1
+                process_message(source_message)
 
         return Response(
             {'received': len(serializer.validated_data['messages']), 'created': created},

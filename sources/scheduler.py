@@ -24,6 +24,16 @@ def run_gmail_sync_job():
             logger.exception('Gmail sync failed for user %s', credential.user_id)
 
 
+@close_old_connections
+def run_coupon_status_refresh_job():
+    # Lives on this app's scheduler rather than spinning up a second
+    # BackgroundScheduler in coupons -- one in-process job runner is enough
+    # for a two-person minor project; the job itself is coupons' own logic.
+    from coupons.status_refresh import refresh_statuses
+
+    refresh_statuses()
+
+
 def start():
     """Start the in-process APScheduler, backed by a DB jobstore for persistence.
 
@@ -43,7 +53,17 @@ def start():
         max_instances=1,
         replace_existing=True,
     )
+    scheduler.add_job(
+        run_coupon_status_refresh_job,
+        trigger=IntervalTrigger(minutes=settings.COUPON_STATUS_REFRESH_MINUTES),
+        id='coupon_status_refresh',
+        max_instances=1,
+        replace_existing=True,
+    )
     scheduler.start()
     _scheduler = scheduler
-    logger.info('APScheduler started — gmail_sync every %s minute(s)', settings.GMAIL_SYNC_INTERVAL_MINUTES)
+    logger.info(
+        'APScheduler started — gmail_sync every %s minute(s), coupon_status_refresh every %s minute(s)',
+        settings.GMAIL_SYNC_INTERVAL_MINUTES, settings.COUPON_STATUS_REFRESH_MINUTES,
+    )
     return scheduler

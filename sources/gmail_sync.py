@@ -8,6 +8,8 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from coupons.pipeline import process_message
+
 from .models import GmailCredential, SourceMessage
 
 logger = logging.getLogger(__name__)
@@ -121,14 +123,34 @@ def _store_message(service, user, message_id):
         logger.warning('Failed to fetch Gmail message %s for user %s: %s', message_id, user.user_id, exc)
         return False
 
-    text = _extract_plain_text(full.get('payload', {}))
-    SourceMessage.objects.create(
+    payload = full.get('payload', {})
+    text = _extract_plain_text(payload)
+    raw_text = _prepend_headers(payload, text)
+    source_message = SourceMessage.objects.create(
         user=user,
         source_type=SourceMessage.SourceType.GMAIL,
-        raw_ref=text,
+        raw_ref=raw_text,
         external_id=message_id,
     )
+    process_message(source_message)
     return True
+
+
+def _prepend_headers(payload, text):
+    """Mirror sources.views SMSSyncView's "From: X\\n" convention so the
+    extraction engine (coupons.extraction) has one consistent merchant
+    signal across both source types, instead of SMS having a sender line
+    and Gmail having none.
+    """
+    headers = {h['name']: h['value'] for h in payload.get('headers', []) if 'name' in h and 'value' in h}
+    from_header = headers.get('From', '')
+    subject = headers.get('Subject', '')
+    prefix = ''
+    if from_header:
+        prefix += f'From: {from_header}\n'
+    if subject:
+        prefix += f'Subject: {subject}\n'
+    return prefix + text
 
 
 def _extract_plain_text(payload):

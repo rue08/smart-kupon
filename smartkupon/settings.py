@@ -124,6 +124,17 @@ GMAIL_SYNC_INTERVAL_MINUTES = int(os.environ.get('GMAIL_SYNC_INTERVAL_MINUTES', 
 RUN_SCHEDULER_ON_RUNSERVER = os.environ.get('RUN_SCHEDULER_ON_RUNSERVER', 'True') == 'True'
 
 
+# Coupon expiry tracking (coupons app) — FR-6
+
+# Window (days) within which an unexpired coupon counts as "expiring_soon" (FR-6.2).
+COUPON_EXPIRING_SOON_DAYS = int(os.environ.get('COUPON_EXPIRING_SOON_DAYS', '3'))
+
+# How often the scheduled job (sources.scheduler) bulk-refreshes stored
+# Coupon.status from expiry_date (coupons.status_refresh) — status is also
+# self-healed on a single-coupon read regardless of this interval.
+COUPON_STATUS_REFRESH_MINUTES = int(os.environ.get('COUPON_STATUS_REFRESH_MINUTES', '60'))
+
+
 # Password validation
 # https://docs.djangoproject.com/en/6.1/ref/settings/#auth-password-validators
 

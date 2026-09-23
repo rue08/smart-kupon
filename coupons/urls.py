@@ -1,11 +1,11 @@
 from django.urls import path
 
+from . import views
+
 app_name = 'coupons'
 
 urlpatterns = [
-    # GET               /api/v1/coupons           -- list coupons (search, category, source, status, sort)
-    # GET               /api/v1/coupons/{id}      -- retrieve a single coupon's detail
-    # PATCH             /api/v1/coupons/{id}      -- update a coupon (mark used, change category)
-    # DELETE            /api/v1/coupons/{id}      -- delete a coupon owned by the user
-    # GET               /api/v1/coupons/expiring  -- list coupons expiring within a configurable window (FR-6.2)
+    path('', views.CouponListView.as_view(), name='coupon-list'),
+    path('expiring', views.CouponExpiringView.as_view(), name='coupon-expiring'),
+    path('<uuid:coupon_id>', views.CouponDetailView.as_view(), name='coupon-detail'),
 ]
