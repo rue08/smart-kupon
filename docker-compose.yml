@@ -1,0 +1,41 @@
+services:
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      # postgres 18's image expects the mount at /var/lib/postgresql itself
+      # (not .../data) -- it manages version-specific subdirectories now.
+      - smartkupon_db_data:/var/lib/postgresql
+    ports:
+      # host 5434 -- 5432 is taken by another project's Docker Postgres,
+      # 5433 is this machine's native (non-Docker) Postgres install.
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # override the native .env's localhost:5433 -- inside the container,
+      # the db service is reachable by its service name, not "localhost".
+      DB_HOST: db
+      DB_PORT: "5432"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+
+volumes:
+  smartkupon_db_data:
