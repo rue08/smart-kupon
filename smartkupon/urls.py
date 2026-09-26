@@ -17,9 +17,13 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import include, path
 
+from . import docs_views
+
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/v1/auth/', include('accounts.urls')),
     path('api/v1/', include('sources.urls')),
     path('api/v1/coupons/', include('coupons.urls')),
+    path('docs', docs_views.api_docs, name='api-docs'),
+    path('openapi.yaml', docs_views.openapi_spec, name='openapi-spec'),
 ]

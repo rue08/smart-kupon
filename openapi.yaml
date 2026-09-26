@@ -1,0 +1,704 @@
+openapi: 3.1.0
+info:
+  title: SmartKupon API
+  version: 1.0.0
+  description: >-
+    Backend for SmartKupon: extracts structured coupons (merchant, code,
+    discount, expiry) out of a user's SMS and Gmail messages, deduplicates
+    them, and serves a searchable, expiry-aware dashboard.
+
+
+    **Authentication.** Every route except `POST /auth/firebase/login` and
+    `GET /sources/gmail/callback` expects `Authorization: Bearer <Firebase ID
+    token>`. The backend verifies the token on every request
+    (`accounts.authentication.FirebaseAuthentication`) and resolves it to a
+    local `User` row — it does **not** create one on the fly. A valid token
+    for a Firebase account with no matching local user is rejected; call the
+    login endpoint first.
+
+
+    **Bootstrapping an account.** `POST /auth/firebase/login` is the one route
+    that accepts a token for a user that may not exist locally yet — it
+    verifies the token and creates the local `User` row on first sign-in
+    (`get_or_create` on the Firebase UID), or returns the existing one on
+    every sign-in after that.
+
+
+    **Connecting Gmail (OAuth flow).**
+
+
+    1. Client calls `GET /sources/gmail/authorize` (needs a bearer token) and
+    opens the returned `authorization_url` in a browser/webview.
+
+    2. The user consents on Google's own screen. Google redirects the browser
+    to `GET /sources/gmail/callback` — a plain, unauthenticated redirect, so
+    the user is identified by a signed `state` parameter instead of a bearer
+    token.
+
+    3. From then on, Gmail is synced automatically on a schedule
+    (`GMAIL_SYNC_INTERVAL_MINUTES`, default 15) or on demand via `POST
+    /sync/gmail/trigger`.
+
+
+    **SMS ingestion.** Android grants SMS-read permission to the installed
+    app, not to a server, so the backend can only ever receive text the
+    Flutter app already read off-device. `POST /sources/sms/sync` accepts a
+    batch (max 200) of `{body, sender, external_id}` objects; resending the
+    same batch is a no-op (dedup by client `external_id`, or a
+    `sha256(sender+body)` fallback).
+
+
+    **Extraction is automatic, not a separate call.** Every new
+    `SourceMessage` — from either source — is run through the regex
+    extraction engine synchronously as soon as it's stored. There is no
+    "extract now" endpoint; coupons simply appear in `GET /coupons` once
+    ingestion has happened.
+
+
+    **Coupon status.** `status` (`active` / `expiring_soon` / `expired` /
+    `used`) is computed from `expiry_date` against a configurable window
+    (`COUPON_EXPIRING_SOON_DAYS`, default 3 days), except `used`, which is a
+    persisted manual fact that always wins. It's kept accurate by a
+    self-healing recompute on every single-coupon read plus a scheduled bulk
+    refresh (`COUPON_STATUS_REFRESH_MINUTES`, default 60) — list/search/filter
+    endpoints query the stored column directly, so they can lag the true
+    status by up to one refresh interval.
+security:
+  - BearerAuth: []
+tags:
+  - name: Auth
+    description: Firebase-token bootstrap and the authenticated user's own profile.
+  - name: Sources
+    description: Gmail OAuth connection and sync, plus on-device SMS ingestion.
+  - name: Coupons
+    description: The coupon dashboard — list, search, filter, sort, expiry view, and
+      per-coupon actions.
+servers:
+  - url: /api/v1
+    description: Relative to wherever the Django backend is deployed
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Firebase ID token
+      description: A Firebase ID token, verified server-side on every request and
+        resolved to a local `User` by Firebase UID.
+  responses:
+    Unauthorized:
+      description: Missing, malformed, invalid/expired bearer token, or a valid token
+        for a Firebase account with no local SmartKupon user yet
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Detail"
+          examples:
+            missingHeader:
+              summary: No Authorization header
+              value:
+                detail: Authentication credentials were not provided.
+            malformed:
+              summary: Header isn't "Bearer <token>"
+              value:
+                detail: Authorization header must be "Bearer <token>".
+            noLocalUser:
+              summary: Token valid, but no local account yet
+              value:
+                detail: No SmartKupon account for this Firebase user yet. Call the
+                  login endpoint first.
+    NotFound:
+      description: No coupon with that id owned by the caller
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Detail"
+          example:
+            detail: Not found.
+    ValidationError:
+      description: Request body failed validation. Shape is DRF's default —
+        each invalid field name maps to an array of error strings; a
+        request-level (non-field) error appears under `non_field_errors`.
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties:
+              type: array
+              items:
+                type: string
+          examples:
+            emptyBatch:
+              summary: SMS sync with an empty messages array
+              value:
+                messages:
+                  - This list may not be empty.
+            statusNotUsed:
+              summary: PATCH /coupons/{id} trying to set status to something
+                other than "used"
+              value:
+                status:
+                  - status can only be set to "used" via this endpoint.
+  parameters:
+    Search:
+      in: query
+      name: search
+      schema:
+        type: string
+      description: Case-insensitive match against coupon code or merchant name
+      example: SAVE20
+    Category:
+      in: query
+      name: category
+      schema:
+        type: string
+      description: Exact category name, case-insensitive
+      example: Electronics
+    Source:
+      in: query
+      name: source
+      schema:
+        type: string
+        enum:
+          - sms
+          - gmail
+      description: Restrict to coupons extracted from this channel
+    Status:
+      in: query
+      name: status
+      schema:
+        $ref: "#/components/schemas/CouponStatus"
+      description: Exact status match
+    Sort:
+      in: query
+      name: sort
+      schema:
+        type: string
+        enum:
+          - expiry_date
+          - discount_value
+      description: Sort key. Omitted or unrecognized falls back to
+        newest-created-first.
+    Page:
+      in: query
+      name: page
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+      description: 1-indexed page number. Page size is fixed at 20.
+  schemas:
+    Detail:
+      type: object
+      properties:
+        detail:
+          type: string
+    User:
+      type: object
+      description: A registered SmartKupon account. Not Django's built-in auth
+        user — this is the local profile row a verified Firebase identity
+        resolves to.
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: Mehul Sharma
+        email:
+          type: string
+          format: email
+          example: mehul@example.com
+        created_at:
+          type: string
+          format: date-time
+    Merchant:
+      type: object
+      description: A normalized merchant name ("Amazon", "amazon.in", "AMAZON" all
+        resolve to one row) so merchant search/filter returns complete
+        results.
+      properties:
+        merchant_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: Amazon
+    Category:
+      type: object
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          example: Electronics
+    CouponStatus:
+      type: string
+      enum:
+        - active
+        - expiring_soon
+        - expired
+        - used
+      description: "`used` is a persisted manual fact and always wins over the
+        expiry-derived states."
+    Coupon:
+      type: object
+      description: A structured, deduplicated coupon record — the system's central
+        entity.
+      properties:
+        coupon_id:
+          type: string
+          format: uuid
+        merchant:
+          oneOf:
+            - $ref: "#/components/schemas/Merchant"
+            - type: "null"
+          description: Null when the extraction engine couldn't resolve a merchant
+            confidently — see `is_low_confidence`.
+        categories:
+          type: array
+          items:
+            $ref: "#/components/schemas/Category"
+        coupon_code:
+          type: string
+          example: SAVE20
+        discount_value:
+          type: string
+          description: Free-form, as extracted (not normalized to a number since
+            source formatting varies, e.g. percentage vs. flat amount)
+          example: 20%
+        expiry_date:
+          type: string
+          format: date
+          nullable: true
+          description: Null when the source message didn't contain a parseable
+            expiry expression
+          example: 2026-10-15
+        status:
+          $ref: "#/components/schemas/CouponStatus"
+        is_low_confidence:
+          type: boolean
+          description: True when a coupon code was found but merchant and/or expiry
+            couldn't be resolved confidently — surfaced for the user
+            to confirm or discard rather than silently trusted.
+        source:
+          type: string
+          enum:
+            - sms
+            - gmail
+          nullable: true
+          description: Null for a coupon added manually with no backing SourceMessage
+        created_at:
+          type: string
+          format: date-time
+    CouponList:
+      type: object
+      description: Standard DRF page-number pagination envelope.
+      properties:
+        count:
+          type: integer
+          example: 42
+        next:
+          type: string
+          format: uri
+          nullable: true
+        previous:
+          type: string
+          format: uri
+          nullable: true
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Coupon"
+    CouponUpdateInput:
+      type: object
+      description: Both fields are optional and independent — send only what you're
+        changing.
+      properties:
+        status:
+          type: string
+          enum:
+            - used
+          description: The only status value settable through this endpoint;
+            active/expiring_soon/expired are always derived from expiry_date.
+        category_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Replaces the coupon's full category set
+    SMSMessageInput:
+      type: object
+      required:
+        - body
+      properties:
+        body:
+          type: string
+          description: Raw message text, exactly as read on-device
+          example: Use code SAVE20 for 20% off at Amazon, valid till 15 Oct.
+        sender:
+          type: string
+          description: The SMS sender id/header, if available — improves merchant
+            resolution
+          example: AD-AMAZON
+        external_id:
+          type: string
+          description: Client-supplied id (e.g. Android's on-device SMS row id) for
+            dedup. If omitted, the server derives one from sha256(sender +
+            body), so resending the same message is still a no-op.
+    SMSSyncRequest:
+      type: object
+      required:
+        - messages
+      properties:
+        messages:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items:
+            $ref: "#/components/schemas/SMSMessageInput"
+paths:
+  /auth/firebase/login:
+    post:
+      tags:
+        - Auth
+      summary: Bootstrap / log in
+      security:
+        - BearerAuth: []
+      description: Verifies the Firebase ID token in the Authorization header, then
+        creates (first sign-in) or returns (every sign-in after that) the
+        matching local `User` row. This is the only route that accepts a
+        token with no local user behind it yet.
+      responses:
+        "200":
+          description: Existing user — token matched an account created on a
+            previous sign-in
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "201":
+          description: New user — first sign-in with this Firebase account
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          description: Missing, malformed, invalid, or expired bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Detail"
+              examples:
+                missingHeader:
+                  summary: No Authorization header
+                  value:
+                    detail: Authorization header must be "Bearer <token>".
+                invalid:
+                  summary: Bad or expired token
+                  value:
+                    detail: Firebase ID token verification failed.
+  /auth/me:
+    get:
+      tags:
+        - Auth
+      summary: Get my profile
+      description: The authenticated user's own profile row.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /sources/gmail/authorize:
+    get:
+      tags:
+        - Sources
+      summary: Start Gmail OAuth
+      description: Returns the Google consent URL to open in a browser/webview. Google
+        redirects to `GET /sources/gmail/callback` once the user consents.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  authorization_url:
+                    type: string
+                    format: uri
+              example:
+                authorization_url: https://accounts.google.com/o/oauth2/auth?...
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Google OAuth client id/secret aren't configured on the server
+            yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Detail"
+  /sources/gmail/callback:
+    get:
+      tags:
+        - Sources
+      summary: Gmail OAuth redirect target
+      security: []
+      description: Google's browser redirect after user consent — not an
+        authenticated API call, so it carries no bearer token. The user is
+        identified by the signed `state` query param minted in `GET
+        /sources/gmail/authorize`. Stores the resulting OAuth tokens
+        Fernet-encrypted.
+      parameters:
+        - in: query
+          name: code
+          required: true
+          schema:
+            type: string
+          description: Google's authorization code
+        - in: query
+          name: state
+          required: true
+          schema:
+            type: string
+          description: Signed state param identifying which user initiated this flow
+      responses:
+        "200":
+          description: Gmail connected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Detail"
+              example:
+                detail: Gmail connected.
+        "400":
+          description: Missing code/state, an invalid or expired state signature, or
+            Google rejected the authorization code
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Detail"
+              examples:
+                missing:
+                  summary: Missing code or state
+                  value:
+                    detail: Missing code or state.
+                exchangeFailed:
+                  summary: Code exchange with Google failed
+                  value:
+                    detail: "Failed to exchange authorization code: ..."
+        "503":
+          description: Google OAuth client id/secret aren't configured on the server
+            yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Detail"
+  /sync/gmail/trigger:
+    post:
+      tags:
+        - Sources
+      summary: Trigger a Gmail sync now
+      description: Runs an incremental Gmail sync for the current user immediately,
+        instead of waiting for the next scheduled run. Newly ingested
+        messages are extracted synchronously before this responds.
+      responses:
+        "200":
+          description: Sync completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  synced_messages:
+                    type: integer
+                    description: Number of new SourceMessage rows created this run
+              example:
+                synced_messages: 3
+        "400":
+          description: Gmail isn't connected for this account yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Detail"
+              example:
+                detail: Gmail is not connected for this account yet.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "502":
+          description: The Gmail API call failed (quota, revoked access, network)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Detail"
+  /sources/sms/sync:
+    post:
+      tags:
+        - Sources
+      summary: Sync a batch of on-device SMS
+      description: Accepts SMS text the Flutter app already read off-device — the
+        backend never reads SMS itself, since Android grants that permission
+        to the installed app, not a server. Each message is deduplicated by
+        `external_id` (or a body/sender hash) and run through the extraction
+        engine synchronously.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SMSSyncRequest"
+            example:
+              messages:
+                - body: Use code SAVE20 for 20% off at Amazon, valid till 15 Oct.
+                  sender: AD-AMAZON
+                  external_id: sms-104829
+      responses:
+        "201":
+          description: Batch accepted (may include already-seen messages, which are
+            no-ops)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received:
+                    type: integer
+                    description: Messages in the request
+                  created:
+                    type: integer
+                    description: New SourceMessage rows actually created (received
+                      minus dedup hits)
+              example:
+                received: 5
+                created: 3
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /coupons:
+    get:
+      tags:
+        - Coupons
+      summary: List coupons
+      description: The authenticated user's coupons, paginated, with optional
+        search/filter/sort.
+      parameters:
+        - $ref: "#/components/parameters/Search"
+        - $ref: "#/components/parameters/Category"
+        - $ref: "#/components/parameters/Source"
+        - $ref: "#/components/parameters/Status"
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Page"
+      responses:
+        "200":
+          description: OK (empty results array if the user has no coupons yet)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CouponList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /coupons/expiring:
+    get:
+      tags:
+        - Coupons
+      summary: List coupons expiring soon
+      description: Same shape as `GET /coupons`, pre-filtered to `status ==
+        expiring_soon` and sorted by soonest expiry first. A focused view for
+        the dashboard's "Expiring Soon" section.
+      parameters:
+        - $ref: "#/components/parameters/Page"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CouponList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /coupons/{coupon_id}:
+    get:
+      tags:
+        - Coupons
+      summary: Get a coupon
+      description: Self-heals `status` on read — recomputes it from `expiry_date`
+        and persists the correction if it had drifted, so a single-coupon
+        view is always accurate regardless of the scheduled bulk-refresh
+        timing.
+      parameters:
+        - in: path
+          name: coupon_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Coupon"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags:
+        - Coupons
+      summary: Update a coupon
+      description: Mark a coupon used and/or replace its category assignments.
+        active/expiring_soon/expired cannot be set here — they're always
+        derived from `expiry_date`.
+      parameters:
+        - in: path
+          name: coupon_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CouponUpdateInput"
+            examples:
+              markUsed:
+                summary: Mark as used
+                value:
+                  status: used
+              recategorize:
+                summary: Replace categories
+                value:
+                  category_ids:
+                    - 3fa85f64-5717-4562-b3fc-2c963f66afa6
+      responses:
+        "200":
+          description: Updated coupon
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Coupon"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags:
+        - Coupons
+      summary: Delete a coupon
+      responses:
+        "204":
+          description: Deleted, no body
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
